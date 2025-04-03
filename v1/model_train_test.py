@@ -1023,12 +1023,15 @@ class Discriminator64(nn.Module):
             nn.Conv2d(256, 512, 4, stride=2, padding=1),           # 8×8 -> 4×4
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 1, 2),                                  # output single value
+            nn.Conv2d(512, 1, 2),                                  # output: (B, 1, 3, 3)
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        return self.model(x).view(-1)
+        out = self.model(x)  # out has shape (B, 1, 3, 3)
+        # Average over spatial dimensions so each sample is a single scalar
+        out = out.mean(dim=[2, 3])  # shape becomes (B, 1)
+        return out.view(-1)        # now returns a tensor of shape (B,)
 
 # =============================================================================
 # Training Functions
