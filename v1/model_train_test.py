@@ -39,7 +39,7 @@ transform_test = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-batch_size = 128  # adjust based on available GPU memory
+batch_size = 64  # adjust based on available GPU memory
 
 # =============================================================================
 # Class names for the binary attribute ("Smiling")
