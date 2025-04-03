@@ -39,7 +39,7 @@ transform_test = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-batch_size = 64  # adjust based on available GPU memory
+batch_size = 128  # adjust based on available GPU memory
 
 # =============================================================================
 # Class names for the binary attribute ("Smiling")
@@ -1033,6 +1033,7 @@ class Discriminator64(nn.Module):
         out = out.mean(dim=[2, 3])  # shape becomes (B, 1)
         return out.view(-1)        # now returns a tensor of shape (B,)
 
+
 # =============================================================================
 # Training Functions
 # =============================================================================
@@ -1048,7 +1049,7 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
     optimizer = optim.AdamW(autoencoder.parameters(), lr=lr, weight_decay=1e-5, betas=(0.9, 0.999))
     discriminator = Discriminator64().to(device)
     d_optimizer = optim.Adam(discriminator.parameters(), lr=1e-4, betas=(0.5, 0.999))
-    gan_criterion = nn.BCELoss()
+    gan_criterion = nn.BCEWithLogitsLoss()
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=lr,
         total_steps=num_epochs * len(train_loader),
@@ -1060,6 +1061,9 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
     loss_history = {'total': [], 'recon': [], 'kl': [], 'class': [], 'center': [], 'perceptual': [], 'gan': []}
     best_loss = float('inf')
     lambda_recon = 1.0
+
+    # Initialize GradScaler for automatic mixed precision (AMP)
+    scaler = torch.cuda.amp.GradScaler()
 
     for epoch in range(num_epochs):
         autoencoder.train()
@@ -1086,62 +1090,68 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
             fake = torch.zeros(data.size(0), device=device)
 
             optimizer.zero_grad()
-            recon_x, mu, logvar, z = autoencoder(data)
-
-            if epoch < 40:
-                kl_factor = 0.0
-                cls_factor = 0.0
-                center_factor = 0.0
-            elif epoch < 80:
-                kl_factor = min(1.0, (epoch - 20) / 20)
-                cls_factor = 0.0
-                center_factor = 0.0
-            elif epoch < 160:
-                kl_factor = 1.0
-                cls_factor = min(0.2, (epoch - 40) / 20)
-                center_factor = 0.0
-            else:
-                kl_factor = 1.0
-                cls_factor = 1.0
-                center_factor = min(1.0, (epoch - 60) / 20)
-
-            recon_loss = euclidean_distance_loss(recon_x, data)
-            perceptual_loss = vgg_loss(recon_x, data)
-            kl_loss = autoencoder.kl_divergence(mu, logvar) if kl_factor > 0 else torch.tensor(0.0, device=device)
-            class_loss = F.cross_entropy(autoencoder.classify(z), labels) if cls_factor > 0 else torch.tensor(0.0, device=device)
-            center_loss = autoencoder.compute_center_loss(z, labels) if center_factor > 0 else torch.tensor(0.0, device=device)
-
-            d_real_loss = gan_criterion(discriminator(data), valid)
-            d_fake_loss = gan_criterion(discriminator(recon_x.detach()), fake)
-            d_loss = (d_real_loss + d_fake_loss) / 2
             d_optimizer.zero_grad()
-            d_loss.backward()
-            d_optimizer.step()
 
-            adv_loss = gan_criterion(discriminator(recon_x), valid)
+            # Use AMP for the forward pass to reduce memory usage
+            with torch.amp.autocast("cuda"):
+                recon_x, mu, logvar, z = autoencoder(data)
 
-            recon_scale = 1.0
-            if recon_loss.item() > 1e-8:
-                perceptual_scale = min(1.0, recon_loss.item() / (perceptual_loss.item() + 1e-8))
-                kl_scale = min(1.0, recon_loss.item() / (kl_loss.item() + 1e-8)) if kl_loss.item() > 0 else 1.0
-                gan_scale = min(1.0, recon_loss.item() / (adv_loss.item() + 1e-8))
-            else:
-                perceptual_scale = 1.0
-                kl_scale = 1.0
-                gan_scale = 1.0
+                if epoch < 40:
+                    kl_factor = 0.0
+                    cls_factor = 0.0
+                    center_factor = 0.0
+                elif epoch < 80:
+                    kl_factor = min(1.0, (epoch - 20) / 20)
+                    cls_factor = 0.0
+                    center_factor = 0.0
+                elif epoch < 160:
+                    kl_factor = 1.0
+                    cls_factor = min(0.2, (epoch - 40) / 20)
+                    center_factor = 0.0
+                else:
+                    kl_factor = 1.0
+                    cls_factor = 1.0
+                    center_factor = min(1.0, (epoch - 60) / 20)
 
-            total_loss = (
-                    lambda_recon * recon_scale * recon_loss +
+                recon_loss = euclidean_distance_loss(recon_x, data)
+                perceptual_loss = vgg_loss(recon_x, data)
+                kl_loss = autoencoder.kl_divergence(mu, logvar) if kl_factor > 0 else torch.tensor(0.0, device=device)
+                class_loss = F.cross_entropy(autoencoder.classify(z), labels) if cls_factor > 0 else torch.tensor(0.0, device=device)
+                center_loss = autoencoder.compute_center_loss(z, labels) if center_factor > 0 else torch.tensor(0.0, device=device)
+
+                d_real_loss = gan_criterion(discriminator(data), valid)
+                d_fake_loss = gan_criterion(discriminator(recon_x.detach()), fake)
+                d_loss = (d_real_loss + d_fake_loss) / 2
+
+                # Train the discriminator
+                d_loss.backward()
+                d_optimizer.step()
+
+                adv_loss = gan_criterion(discriminator(recon_x), valid)
+
+                if recon_loss.item() > 1e-8:
+                    perceptual_scale = min(1.0, recon_loss.item() / (perceptual_loss.item() + 1e-8))
+                    kl_scale = min(1.0, recon_loss.item() / (kl_loss.item() + 1e-8)) if kl_loss.item() > 0 else 1.0
+                    gan_scale = min(1.0, recon_loss.item() / (adv_loss.item() + 1e-8))
+                else:
+                    perceptual_scale = 1.0
+                    kl_scale = 1.0
+                    gan_scale = 1.0
+
+                total_loss = (
+                    lambda_recon * recon_loss +
                     lambda_vgg * perceptual_scale * perceptual_loss +
                     kl_weight * kl_scale * kl_factor * kl_loss +
                     lambda_cls * cls_factor * class_loss +
                     lambda_center * center_factor * center_loss +
                     lambda_gan * gan_scale * adv_loss
-            )
+                )
 
-            total_loss.backward()
+            # Scale the loss and backpropagate using AMP
+            scaler.scale(total_loss).backward()
             torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             with torch.no_grad():
@@ -1155,6 +1165,12 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
             epoch_center_loss += center_loss.item() if isinstance(center_loss, torch.Tensor) else 0
             epoch_total_loss += total_loss.item()
             epoch_gan_loss += adv_loss.item()
+
+            # Optionally remove references to temporary tensors
+            del data, labels, recon_x, mu, logvar, z, total_loss
+
+        # Clear cached GPU memory at the end of each epoch
+        torch.cuda.empty_cache()
 
         num_batches = len(train_loader)
         avg_recon_loss = epoch_recon_loss / num_batches
@@ -1173,9 +1189,9 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
         loss_history['gan'].append(avg_gan_loss)
 
         print(
-            f"Epoch {epoch + 1}/{num_epochs}, Recon Lambda * Scale: {lambda_recon * recon_scale:.6f}, Perceptual Lambda * Scale: {lambda_vgg * perceptual_scale:.6f}, KL Lambda * Scale: {kl_factor * kl_weight:.6f}, GAN Lambda * Scale: {gan_scale * lambda_gan:.6f}")
-        print(
-            f"Epoch {epoch + 1}/{num_epochs}, Total Loss: {avg_total_loss:.6f}, Recon Loss: {avg_recon_loss:.6f}, Perceptual Loss: {avg_perceptual_loss:.6f}, KL Loss: {avg_kl_loss:.6f}, GAN Loss: {avg_gan_loss:.6f}, Class Loss: {avg_class_loss:.6f}, Center Loss: {avg_center_loss:.6f}")
+            f"Epoch {epoch + 1}/{num_epochs}, Total Loss: {avg_total_loss:.6f}, Recon Loss: {avg_recon_loss:.6f}, "
+            f"Perceptual Loss: {avg_perceptual_loss:.6f}, KL Loss: {avg_kl_loss:.6f}, GAN Loss: {avg_gan_loss:.6f}, "
+            f"Class Loss: {avg_class_loss:.6f}, Center Loss: {avg_center_loss:.6f}")
 
         if loss_history['total'][-1] < best_loss:
             best_loss = loss_history['total'][-1]
@@ -1186,7 +1202,7 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
 
         if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
             visualize_reconstructions(autoencoder, epoch + 1, save_dir)
-            visualize_latent_space(autoencoder, epoch + 1, save_dir)
+            # visualize_latent_space(autoencoder, epoch + 1, save_dir)
 
     torch.save({
         'autoencoder': autoencoder.state_dict(),
@@ -1266,7 +1282,7 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
         scheduler.step()
         if (epoch + 1) % visualize_every == 0 or epoch == start_epoch + num_epochs - 1:
             latent_save_path = os.path.join(save_dir, f"latent_comparison_epoch_{epoch + 1}.png")
-            visualize_latent_comparison(autoencoder, diffusion, visualization_loader, latent_save_path)
+            # visualize_latent_comparison(autoencoder, diffusion, visualization_loader, latent_save_path)
             for class_idx in range(min(len(class_names), 2)):
                 create_diffusion_animation(autoencoder, diffusion, class_idx=class_idx, num_frames=50,
                                            save_path=f"{save_dir}/diffusion_animation_{class_names[class_idx]}_epoch_{epoch + 1}.gif")
@@ -1304,12 +1320,12 @@ def main(checkpoint_path=None, total_epochs=2000):
         autoencoder, discriminator, ae_losses = train_autoencoder(
             autoencoder,
             train_loader,
-            num_epochs=1200,
+            num_epochs=2000,
             lr=1e-4,
             lambda_cls=0.3,
             lambda_center=0.1,
             lambda_vgg=0.4,
-            visualize_every=50,
+            visualize_every=1,
             save_dir=results_dir
         )
         torch.save(autoencoder.state_dict(), autoencoder_path)
@@ -1421,4 +1437,3 @@ def main(checkpoint_path=None, total_epochs=2000):
 
 if __name__ == "__main__":
     main(total_epochs=10000)
-
