@@ -1382,7 +1382,7 @@ def main(checkpoint_path=None, total_epochs=2000):
     print("Loading CelebA dataset for Smiling attribute...")
     train_dataset = CelebASmiling(root='./data', split="train", transform=transform_train, download=True)
     global class_names
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
     autoencoder_path = f"{results_dir}/vae_gan_final.pt"
     diffusion_path = f"{results_dir}/conditional_diffusion_final.pt"
