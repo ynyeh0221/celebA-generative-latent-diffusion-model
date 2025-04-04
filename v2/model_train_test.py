@@ -12,6 +12,9 @@ from tqdm.auto import tqdm
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 import imageio
+import torchvision
+from PIL import Image
+
 
 # If using Colab
 from google.colab import drive
@@ -39,7 +42,7 @@ transform_test = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-batch_size = 128  # adjust based on available GPU memory
+batch_size = 256  # adjust based on available GPU memory
 
 # =============================================================================
 # Class names for the binary attribute ("Smiling")
@@ -49,18 +52,68 @@ class_names = ["Not Smiling", "Smiling"]
 # =============================================================================
 # Custom CelebA Dataset for Smiling attribute
 # =============================================================================
-class CelebASmiling(datasets.CelebA):
-    def __init__(self, root, split, transform, download=True):
-        # Use target_type "attr" to get the attributes
-        super().__init__(root=root, split=split, target_type="attr", transform=transform, download=download)
-        # Get index for the "Smiling" attribute from the attribute names list
-        self.smiling_idx = self.attr_names.index("Smiling")
-
+class CelebASmiling(torch.utils.data.Dataset):
+    def __init__(self, root, split, transform=None, download=False):
+        self.root = root
+        self.transform = transform
+        self.split = split
+        
+        # Only warn instead of attempting to download
+        if download:
+            print("The 'download' parameter is ignored; the dataset will be loaded locally.")
+        
+        # Load partition information (train/valid/test)
+        split_map = {'train': 0, 'valid': 1, 'test': 2}
+        split_value = split_map.get(split, 0)
+        
+        partition_file = os.path.join(root, 'list_eval_partition.txt')
+        
+        self.filename = []
+        with open(partition_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2 and int(parts[1]) == split_value:
+                    self.filename.append(parts[0])
+        
+        # Load attribute labels
+        attr_file = os.path.join(root, 'list_attr_celeba.txt')
+        attr_lines = open(attr_file, 'r').readlines()
+        
+        # Get attribute names
+        self.attr_names = attr_lines[1].strip().split()
+        self.smiling_idx = self.attr_names.index('Smiling')
+        
+        # Parse attribute data
+        self.attr_data = {}
+        for line in attr_lines[2:]:
+            parts = line.strip().split()
+            if len(parts) > 1:
+                fname = parts[0]
+                attrs = [1 if int(a) > 0 else 0 for a in parts[1:]]
+                self.attr_data[fname] = attrs
+        
+        # Keep only the attribute data for filenames in the partition split
+        self.filename = [f for f in self.filename if f in self.attr_data]
+    
+    def __len__(self):
+        return len(self.filename)
+    
     def __getitem__(self, index):
-        img, attr = super().__getitem__(index)
-        # Convert the attribute value from (-1, 1) to (0, 1)
-        label = 1 if attr[self.smiling_idx] == 1 else 0
-        return img, label
+        fname = self.filename[index]
+        img_path = os.path.join(self.root, 'img_align_celeba', fname)
+        
+        # Load image
+        img = Image.open(img_path).convert('RGB')
+        
+        # Apply transformations
+        if self.transform:
+            img = self.transform(img)
+        
+        # Get smiling attribute (0 or 1)
+        attrs = self.attr_data[fname]
+        smile_label = attrs[self.smiling_idx]
+        
+        return img, smile_label
 
 # =============================================================================
 # Activation and Helper Layers
@@ -422,7 +475,8 @@ class SimpleAutoencoder(nn.Module):
                 class_mean = class_samples.mean(0)
                 old_center = self.class_centers[label]
                 new_center = momentum * old_center + (1 - momentum) * class_mean
-                self.class_centers[label] = new_center
+                # Use in-place update to modify the registered buffer safely
+                self.class_centers[label].copy_(new_center)
 
     def kl_divergence(self, mu, logvar):
         mu = torch.clamp(mu, min=-10.0, max=10.0)
@@ -614,10 +668,10 @@ class ConditionalUNet(nn.Module):
         # Decoder Block 2: refine features at 8x8 resolution
         self.dec2 = nn.Sequential(
             nn.Conv2d(base_channels, self.in_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(8, self.in_channels),
+            nn.GroupNorm(num_groups=min(8, self.in_channels), num_channels=self.in_channels),
             Swish(),
             nn.Conv2d(self.in_channels, self.in_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(8, self.in_channels),
+            nn.GroupNorm(num_groups=min(8, self.in_channels), num_channels=self.in_channels),
             Swish()
         )
         
@@ -752,7 +806,7 @@ def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./res
         "Both classes (Smiling vs Not Smiling) are visualized."
     )
     plt.figtext(0.5, 0.01, description, ha='center', fontsize=10,
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.7))
+                bbox=dict(boxstyle='round', pad=0.5, facecolor='white', alpha=0.7))
     plt.tight_layout(rect=[0, 0.03, 1, 0.92])
     save_path = f"{save_dir}/vae_samples_grid_celeba.png"
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -767,7 +821,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
     autoencoder.eval()
     diffusion.eps_model.eval()
     print(f"Generating latent space projection for class {class_names[class_idx]}...")
-    test_dataset = CelebASmiling(root="./data", split="test", transform=transform_test, download=True)
+    test_dataset = CelebASmiling(root="/content/celeba_data", split="test", transform=transform_test, download=False)
     test_loader = DataLoader(test_dataset, batch_size=500, shuffle=False)
     all_latents = []
     all_labels = []
@@ -900,7 +954,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
 def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
     os.makedirs(save_dir, exist_ok=True)
     device = next(autoencoder.parameters()).device
-    test_dataset = CelebASmiling(root="./data", split="test", transform=transform_test, download=True)
+    test_dataset = CelebASmiling(root="/content/celeba_data", split="test", transform=transform_test, download=False)
     test_loader = DataLoader(test_dataset, batch_size=8, shuffle=True)
     test_images, test_labels = next(iter(test_loader))
     test_images = test_images.to(device)
@@ -928,7 +982,7 @@ def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
 def visualize_latent_space(autoencoder, epoch, save_dir="./results"):
     os.makedirs(save_dir, exist_ok=True)
     device = next(autoencoder.parameters()).device
-    test_dataset = CelebASmiling(root="./data", split="test", transform=transform_test, download=True)
+    test_dataset = CelebASmiling(root="/content/celeba_data", split="test", transform=transform_test, download=False)
     test_loader = DataLoader(test_dataset, batch_size=500, shuffle=False)
     autoencoder.eval()
     all_latents = []
@@ -1319,8 +1373,8 @@ def visualize_latent_comparison(autoencoder, diffusion, data_loader, save_path):
         axes[1, i].axis("off")
         axes[2, i].imshow(images[i].cpu().permute(1, 2, 0).numpy())
         axes[2, i].axis("off")
-    axes[0, 0].set_title("VAE reconstruction（actual latent）", fontsize=10)
-    axes[1, 0].set_title("Diffusion（denoised latent）", fontsize=10)
+    axes[0, 0].set_title("VAE reconstruction (actual latent)", fontsize=10)
+    axes[1, 0].set_title("Diffusion (denoised latent)", fontsize=10)
     axes[2, 0].set_title("Original", fontsize=10)
     plt.tight_layout()
     plt.savefig(save_path)
@@ -1373,14 +1427,232 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
     print(f"Saved final diffusion model after {start_epoch + num_epochs} epochs")
     return unet, diffusion, loss_history
 
+def prepare_celeba_dataset(zip_path, extract_path):
+    """
+    Copy the CelebA dataset ZIP file from Google Drive and extract it locally.
+    
+    Parameters:
+        zip_path: Path to the ZIP file in Google Drive
+        extract_path: Destination path for extraction
+    
+    Returns:
+        bool: Whether the operation was successful
+    """
+    import os
+    import shutil
+    from zipfile import ZipFile
+    
+    print("Preparing CelebA dataset...")
+    os.makedirs(extract_path, exist_ok=True)
+    
+    # Check if the ZIP file exists
+    if not os.path.exists(zip_path):
+        print(f"Error: ZIP file not found at {zip_path}")
+        return False
+    
+    # Check if files have already been extracted
+    if os.path.exists(os.path.join(extract_path, 'img_align_celeba')) and \
+       os.path.exists(os.path.join(extract_path, 'list_attr_celeba.txt')):
+        print(f"Dataset already exists in {extract_path}, skipping extraction")
+        return True
+    
+    print(f"Copying ZIP file from {zip_path} to {extract_path}...")
+    try:
+        # Copy file in chunks to avoid memory issues (10MB chunks)
+        with open(zip_path, 'rb') as src_file:
+            with open(os.path.join(extract_path, 'celeba.zip'), 'wb') as dst_file:
+                shutil.copyfileobj(src_file, dst_file, 1024*1024*10)
+    except Exception as e:
+        print(f"Error copying file: {str(e)}")
+        return False
+    
+    print("Extracting dataset...")
+    try:
+        with ZipFile(os.path.join(extract_path, 'celeba.zip'), 'r') as zip_ref:
+            zip_ref.extractall(extract_path)
+        print("Extraction complete")
+        
+        # Delete the ZIP file to save space
+        os.remove(os.path.join(extract_path, 'celeba.zip'))
+        print("Deleted local ZIP copy to save space")
+        
+        return True
+    except Exception as e:
+        print(f"Error extracting files: {str(e)}")
+        return False
+
+def validate_celeba_path(root_path):
+    """Validate that the CelebA dataset path is correct"""
+    required_files = [
+        os.path.join(root_path, 'list_attr_celeba.txt'),
+        os.path.join(root_path, 'list_eval_partition.txt'),
+        os.path.join(root_path, 'img_align_celeba')
+    ]
+    
+    for path in required_files:
+        if not os.path.exists(path):
+            print(f"Error: {path} not found")
+            return False
+    
+    # Check if the image directory contains images
+    img_dir = os.path.join(root_path, 'img_align_celeba')
+    if not os.path.isdir(img_dir):
+        print(f"Error: {img_dir} is not a directory")
+        return False
+        
+    img_files = [f for f in os.listdir(img_dir) if f.endswith('.jpg')]
+    if len(img_files) == 0:
+        print(f"Error: No .jpg images found in {img_dir}")
+        return False
+    
+    print(f"Validation successful: Valid CelebA dataset found in {root_path}")
+    print(f"Found {len(img_files)} images")
+    return True
+
+def prepare_celeba_dataset(zip_path, extract_path):
+    """
+    Copy the CelebA dataset ZIP file from Google Drive and extract it locally.
+    
+    Parameters:
+        zip_path: Path to the ZIP file in Google Drive
+        extract_path: Destination path for extraction
+    
+    Returns:
+        bool: Whether the operation was successful
+    """
+    import os
+    import shutil
+    from zipfile import ZipFile
+    
+    print("Preparing CelebA dataset...")
+    os.makedirs(extract_path, exist_ok=True)
+    
+    # Check if the ZIP file exists
+    if not os.path.exists(zip_path):
+        print(f"Error: ZIP file not found at {zip_path}")
+        return False
+    
+    # Copy TXT files (from the same directory)
+    drive_dir = os.path.dirname(zip_path)
+    txt_files = ['list_attr_celeba.txt', 'list_eval_partition.txt']
+    
+    for txt_file in txt_files:
+        src_path = os.path.join(drive_dir, txt_file)
+        dst_path = os.path.join(extract_path, txt_file)
+        
+        if os.path.exists(src_path):
+            print(f"Copying {txt_file} to {extract_path}...")
+            try:
+                shutil.copy(src_path, dst_path)
+                print(f"{txt_file} copied successfully")
+            except Exception as e:
+                print(f"Error copying {txt_file}: {str(e)}")
+        else:
+            print(f"Warning: {src_path} not found")
+    
+    # Check if files have already been extracted
+    if os.path.exists(os.path.join(extract_path, 'img_align_celeba')):
+        print(f"Image directory already exists in {extract_path}, skipping extraction")
+        return True
+    
+    # Parse ZIP file path
+    zip_basename = os.path.basename(zip_path)
+    local_zip_path = os.path.join(extract_path, zip_basename)
+    
+    print(f"Copying ZIP file from {zip_path} to {extract_path}...")
+    try:
+        # Copy file in chunks to avoid memory issues (10MB chunks)
+        with open(zip_path, 'rb') as src_file:
+            with open(local_zip_path, 'wb') as dst_file:
+                shutil.copyfileobj(src_file, dst_file, 1024*1024*10)
+    except Exception as e:
+        print(f"Error copying file: {str(e)}")
+        return False
+    
+    print("Extracting dataset...")
+    try:
+        with ZipFile(local_zip_path, 'r') as zip_ref:
+            # Check ZIP internal structure
+            file_list = zip_ref.namelist()
+            
+            # Check if all files are inside the img_align_celeba directory
+            if all(name.startswith('img_align_celeba/') for name in file_list if name.endswith('.jpg')):
+                # ZIP contains img_align_celeba directory, extract directly
+                zip_ref.extractall(extract_path)
+            else:
+                # ZIP directly contains jpg files; create img_align_celeba directory
+                img_dir = os.path.join(extract_path, 'img_align_celeba')
+                os.makedirs(img_dir, exist_ok=True)
+                
+                # Extract jpg files to img_align_celeba directory
+                for file_info in zip_ref.infolist():
+                    if file_info.filename.endswith('.jpg'):
+                        # Keep only the filename part
+                        filename = os.path.basename(file_info.filename)
+                        # Modify extraction path
+                        file_info.filename = filename
+                        zip_ref.extract(file_info, img_dir)
+        
+        print("Extraction complete")
+        
+        # Delete the ZIP file to save space
+        os.remove(local_zip_path)
+        print("Deleted local ZIP copy to save space")
+        
+        return True
+    except Exception as e:
+        print(f"Error extracting files: {str(e)}")
+        return False
+
+def validate_celeba_path(root_path):
+    """Validate that the CelebA dataset path is correct"""
+    required_files = [
+        os.path.join(root_path, 'list_attr_celeba.txt'),
+        os.path.join(root_path, 'list_eval_partition.txt'),
+        os.path.join(root_path, 'img_align_celeba')
+    ]
+    
+    for path in required_files:
+        if not os.path.exists(path):
+            print(f"Error: {path} not found")
+            return False
+    
+    # Check if the image directory contains images
+    img_dir = os.path.join(root_path, 'img_align_celeba')
+    if not os.path.isdir(img_dir):
+        print(f"Error: {img_dir} is not a directory")
+        return False
+        
+    img_files = [f for f in os.listdir(img_dir) if f.endswith('.jpg')]
+    if len(img_files) == 0:
+        print(f"Error: No .jpg images found in {img_dir}")
+        return False
+    
+    print(f"Validation successful: Valid CelebA dataset found in {root_path}")
+    print(f"Found {len(img_files)} images")
+    return True
+
 def main(checkpoint_path=None, total_epochs=2000):
     print("Starting class-conditional diffusion model for CelebA (Smiling attribute) with improved architecture")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    drive_zip_path = "/content/drive/MyDrive/celeba_smiling_conditional_improved/celeba_data/img_align_celeba.zip"
+    local_dataset_path = "/content/celeba_data"
     results_dir = "/content/drive/MyDrive/celeba_smiling_conditional_improved"
     os.makedirs(results_dir, exist_ok=True)
+    # Prepare dataset
+    if not prepare_celeba_dataset(drive_zip_path, local_dataset_path):
+        print("Dataset preparation failed, exiting")
+        return
+    
+    # Validate dataset path
+    if not validate_celeba_path(local_dataset_path):
+        print("Dataset validation failed, exiting")
+        return
+    
     print("Loading CelebA dataset for Smiling attribute...")
-    train_dataset = CelebASmiling(root='./data', split="train", transform=transform_train, download=True)
+    train_dataset = CelebASmiling(root="/content/celeba_data", split="train", transform=transform_train, download=False)
     global class_names
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
@@ -1421,10 +1693,11 @@ def main(checkpoint_path=None, total_epochs=2000):
         plt.close()
     conditional_unet = ConditionalUNet(
         latent_dim=256,
-        hidden_dims=[256, 512, 1024, 512, 256],
         time_emb_dim=256,
-        num_classes=2
+        num_classes=2,
+        base_channels=64
     ).to(device)
+
 
     def init_weights(m):
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
@@ -1456,7 +1729,7 @@ def main(checkpoint_path=None, total_epochs=2000):
     if 'diffusion' not in globals():
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
             autoencoder, conditional_unet, train_loader, num_epochs=remaining_epochs, lr=1e-3,
-            visualize_every=50,
+            visualize_every=5,
             save_dir=results_dir,
             device=device,
             start_epoch=start_epoch
@@ -1473,7 +1746,7 @@ def main(checkpoint_path=None, total_epochs=2000):
     elif start_epoch > 0:
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
             autoencoder, conditional_unet, train_loader, num_epochs=remaining_epochs, lr=1e-3,
-            visualize_every=50,
+            visualize_every=5,
             save_dir=results_dir,
             device=device,
             start_epoch=start_epoch
@@ -1514,3 +1787,4 @@ def main(checkpoint_path=None, total_epochs=2000):
 
 if __name__ == "__main__":
     main(total_epochs=10000)
+
