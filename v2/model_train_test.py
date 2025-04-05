@@ -1640,7 +1640,8 @@ def validate_celeba_path(root_path):
 
 def main(checkpoint_path=None, total_epochs=2000):
     print("Starting class-conditional diffusion model for CelebA (Smiling attribute) with improved architecture")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps" if torch.backends.mps.is_available() else
+                         ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
 
     drive_zip_path = "/content/drive/MyDrive/celeba_smiling_conditional_improved/celeba_data/img_align_celeba.zip"
