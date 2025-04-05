@@ -133,19 +133,6 @@ The implementation includes:
 - `CelebASmiling`: Custom dataset class for the CelebA dataset
 - Various helper modules for attention, normalization, and activation
 
-## Citation
-
-If you use this code in your research, please cite:
-
-```
-@article{vae-diffusion-faces,
-  title={Class-Conditional VAE-Diffusion for Face Attribute Generation},
-  author={Your Name},
-  journal={arXiv preprint},
-  year={2023}
-}
-```
-
 ## License
 
 [MIT License](LICENSE)
