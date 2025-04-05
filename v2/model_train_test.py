@@ -609,14 +609,14 @@ class ConditionalUNet(nn.Module):
         self.in_channels = latent_dim // (self.H * self.W)  # should be 256 // 64 = 4
         self.latent_dim = latent_dim
         self.time_emb_dim = time_emb_dim
-        
+
         # Time and class embeddings for conditioning
         self.time_embedding = TimeEmbedding(n_channels=time_emb_dim)
         self.class_embedding = ClassEmbedding(num_classes=num_classes, n_channels=time_emb_dim)
-        
+
         # Project latent vector to a feature map of shape (B, 4, 8, 8)
         self.project_in = nn.Linear(latent_dim, self.in_channels * self.H * self.W)
-        
+
         # -------------------- Encoder --------------------
         # Encoder Block 1: keeps resolution at 8x8
         self.enc1 = nn.Sequential(
@@ -630,7 +630,7 @@ class ConditionalUNet(nn.Module):
         # Conditioning for encoder block 1
         self.time_proj_enc1 = nn.Linear(time_emb_dim, base_channels)
         self.class_proj_enc1 = nn.Linear(time_emb_dim, base_channels)
-        
+
         # Encoder Block 2: downsample from 8x8 to 4x4
         self.enc2 = nn.Sequential(
             nn.Conv2d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1),
@@ -642,7 +642,7 @@ class ConditionalUNet(nn.Module):
         )
         self.time_proj_enc2 = nn.Linear(time_emb_dim, base_channels * 2)
         self.class_proj_enc2 = nn.Linear(time_emb_dim, base_channels * 2)
-        
+
         # -------------------- Bottleneck --------------------
         self.bottleneck = nn.Sequential(
             nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1),
@@ -654,7 +654,7 @@ class ConditionalUNet(nn.Module):
         )
         self.time_proj_bottleneck = nn.Linear(time_emb_dim, base_channels * 2)
         self.class_proj_bottleneck = nn.Linear(time_emb_dim, base_channels * 2)
-        
+
         # -------------------- Decoder --------------------
         # Decoder Block 1: upsample from 4x4 back to 8x8
         self.dec1 = nn.Sequential(
@@ -664,7 +664,7 @@ class ConditionalUNet(nn.Module):
         )
         self.time_proj_dec1 = nn.Linear(time_emb_dim, base_channels)
         self.class_proj_dec1 = nn.Linear(time_emb_dim, base_channels)
-        
+
         # Decoder Block 2: refine features at 8x8 resolution
         self.dec2 = nn.Sequential(
             nn.Conv2d(base_channels, self.in_channels, kernel_size=3, padding=1),
@@ -674,10 +674,12 @@ class ConditionalUNet(nn.Module):
             nn.GroupNorm(num_groups=min(8, self.in_channels), num_channels=self.in_channels),
             Swish()
         )
-        
+
         # Project the refined feature map back to a latent vector
         self.project_out = nn.Linear(self.in_channels * self.H * self.W, latent_dim)
-    
+        # Learnable ratio for residual connection
+        self.res_ratio = nn.Parameter(torch.tensor(1.0))
+
     def forward(self, z, t, c):
         """
         z: latent vector of shape (B, latent_dim)
@@ -685,45 +687,49 @@ class ConditionalUNet(nn.Module):
         c: class label tensor of shape (B,)
         """
         batch_size = z.size(0)
-        
+
         # Compute time and class conditioning embeddings
         t_emb = self.time_embedding(t)  # (B, time_emb_dim)
         c_emb = self.class_embedding(c)   # (B, time_emb_dim)
-        
+
         # Project the latent vector to a 2D feature map
         x = self.project_in(z)  # (B, in_channels * H * W)
         x = x.view(batch_size, self.in_channels, self.H, self.W)  # (B, 4, 8, 8)
-        
+
         # --- Encoder Block 1 ---
         x = self.enc1(x)  # (B, base_channels, 8, 8)
         cond1 = self.time_proj_enc1(t_emb) + self.class_proj_enc1(c_emb)  # (B, base_channels)
         cond1 = cond1.view(batch_size, -1, 1, 1)
         x = x + cond1
-        
+
         # --- Encoder Block 2 (Downsampling) ---
         x = self.enc2(x)  # (B, base_channels*2, 4, 4)
         cond2 = self.time_proj_enc2(t_emb) + self.class_proj_enc2(c_emb)  # (B, base_channels*2)
         cond2 = cond2.view(batch_size, -1, 1, 1)
         x = x + cond2
-        
+
         # --- Bottleneck ---
         x = self.bottleneck(x)  # (B, base_channels*2, 4, 4)
         cond_b = self.time_proj_bottleneck(t_emb) + self.class_proj_bottleneck(c_emb)
         cond_b = cond_b.view(batch_size, -1, 1, 1)
         x = x + cond_b
-        
+
         # --- Decoder Block 1 (Upsampling) ---
         x = self.dec1(x)  # (B, base_channels, 8, 8)
         cond_d1 = self.time_proj_dec1(t_emb) + self.class_proj_dec1(c_emb)
         cond_d1 = cond_d1.view(batch_size, -1, 1, 1)
         x = x + cond_d1
-        
+
         # --- Decoder Block 2 (Refinement) ---
         x = self.dec2(x)  # (B, in_channels, 8, 8)
-        
-        # Project back to the original latent vector shape
+
+        # Project the refined feature map back to a latent vector
         x = x.view(batch_size, -1)  # (B, in_channels*H*W)
         out = self.project_out(x)   # (B, latent_dim)
+
+        # Add the learnable residual connection: output + (res_ratio * z)
+        out = out + self.res_ratio * z
+
         return out
 
 # =============================================================================
