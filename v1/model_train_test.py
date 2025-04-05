@@ -1298,7 +1298,8 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
 
 def main(checkpoint_path=None, total_epochs=2000):
     print("Starting class-conditional diffusion model for CelebA (Smiling attribute) with improved architecture")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps" if torch.backends.mps.is_available() else
+                         ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
     results_dir = "/content/drive/MyDrive/celeba_smiling_conditional_improved"
     os.makedirs(results_dir, exist_ok=True)
