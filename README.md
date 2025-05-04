@@ -6,6 +6,8 @@ This repository contains a PyTorch implementation of a class-conditional diffusi
 
 The project implements an advanced generative model that combines a Variational Autoencoder (VAE) with a conditional diffusion model to generate high-quality facial images with control over the smiling attribute. The model can generate both smiling and non-smiling faces with good quality and attribute control.
 
+[DEEPWIKI](https://deepwiki.com/ynyeh0221/celebA-generative-latent-diffusion-model)
+
 ## Features
 
 - **Enhanced VAE Architecture**: Includes channel attention, spatial attention, and uses perceptual loss for improved image quality
